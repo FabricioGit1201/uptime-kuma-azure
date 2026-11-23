@@ -2,183 +2,199 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import sys
 import tarfile
-import sqlite3
 import shutil
+import hashlib
+import sqlite3
 import tempfile
-import subprocess
-
 from pathlib import Path
-from datetime import datetime, timezone
 
-
-DATA_DIR = Path("/home/uptime-kuma-data")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/home/uptime-kuma-data"))
 BACKUP_DIR = Path("/home/uptime-kuma-backups")
 PRESERVED_DIR = BACKUP_DIR / "recovery-preserved"
-
 PENDING_FILE = DATA_DIR / ".recovery-pending"
 
+BACKUP_PATTERN = re.compile(
+    r"^uptime-kuma-[0-9]{8}_[0-9]{6}\.tar\.gz$"
+)
+
 EXCLUDED_FILES = {
-    "BACKUP_INFO.txt",
-    "kuma.db.danada",
     "kuma.db-wal",
     "kuma.db-shm",
     "kuma.db-journal",
+    "kuma.db.danada",
 }
+
+MAX_MEMBERS = 10000
+MAX_TOTAL_SIZE = 2 * 1024 * 1024 * 1024
 
 
 def log(message):
-    print(f"[AUTO-RECOVERY] {message}", flush=True)
+    print(f"[RESTORE] {message}", flush=True)
 
 
-def utc_timestamp():
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+def sha256_file(path):
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
 
 
-def validate_database(database):
-    try:
-        result = subprocess.run(
-            ["sqlite3", str(database), "PRAGMA integrity_check;"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
+def safe_backup_name():
+    if not PENDING_FILE.is_file():
+        raise RuntimeError("No existe la marca de recuperación.")
+
+    name = PENDING_FILE.read_text(encoding="utf-8").strip()
+
+    if not BACKUP_PATTERN.fullmatch(name):
+        raise RuntimeError("El nombre del backup en la marca no es válido.")
+
+    backup = BACKUP_DIR / name
+
+    if backup.is_symlink() or not backup.is_file():
+        raise RuntimeError("El backup indicado no existe o no es un archivo regular.")
+
+    if backup.resolve().parent != BACKUP_DIR.resolve():
+        raise RuntimeError("La ruta del backup no es segura.")
+
+    return backup
+
+
+def safe_member_path(member):
+    name = member.name
+
+    if not name.startswith("uptime-kuma/"):
+        raise RuntimeError(f"Ruta inesperada en backup: {name}")
+
+    relative = Path(name)
+
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError(f"Ruta insegura en backup: {name}")
+
+    if not (member.isfile() or member.isdir()):
+        raise RuntimeError(f"Tipo de archivo no permitido: {name}")
+
+    return relative
+
+
+def extract_and_validate(backup, staging):
+    log(f"Validando backup: {backup.name}")
+
+    with tarfile.open(backup, "r:gz") as archive:
+        members = archive.getmembers()
+
+        if len(members) > MAX_MEMBERS:
+            raise RuntimeError("El backup contiene demasiados elementos.")
+
+        total_size = sum(
+            member.size for member in members if member.isfile()
         )
 
-        output = result.stdout.strip()
+        if total_size > MAX_TOTAL_SIZE:
+            raise RuntimeError("El tamaño del backup supera el límite permitido.")
 
-        if result.returncode != 0 or output != "ok":
-            log(f"Base de datos inválida: {database}")
-            log(f"Resultado SQLite: {output or result.stderr.strip()}")
-            return False
+        validated = []
 
-        return True
+        for member in members:
+            relative = safe_member_path(member)
+            validated.append((member, relative))
 
-    except Exception as error:
-        log(f"Error validando SQLite: {error}")
-        return False
-
-
-def safe_member_path(member_name):
-    if "\\" in member_name:
-        raise ValueError("Ruta con separadores no permitidos")
-
-    path = Path(member_name)
-
-    if path.is_absolute() or ".." in path.parts:
-        raise ValueError("Ruta insegura dentro del backup")
-
-    if not path.parts or path.parts[0] != "uptime-kuma":
-        raise ValueError("El backup contiene rutas fuera de uptime-kuma")
-
-    if any(part in ("", ".") for part in path.parts):
-        raise ValueError("Ruta inválida dentro del backup")
-
-    return path
-
-
-def extract_backup(archive_path, destination):
-    seen = set()
-    database_found = False
-    manifest_found = False
-
-    with tarfile.open(archive_path, "r:gz") as archive:
-
-        for member in archive.getmembers():
-
-            relative = safe_member_path(member.name)
-
-            if member.name in seen:
-                raise ValueError(f"Archivo duplicado: {member.name}")
-
-            seen.add(member.name)
-
-            if not (member.isdir() or member.isfile()):
-                raise ValueError(
-                    f"Tipo de archivo no permitido: {member.name}"
-                )
-
-            if not member.isdir() and not member.isfile():
-                raise ValueError(f"Miembro inválido: {member.name}")
-
-            if relative.parts == ("uptime-kuma",):
-                continue
-
-            if len(relative.parts) < 2:
-                raise ValueError("Estructura de backup incorrecta")
-
-            filename = relative.name
-
-            if filename in EXCLUDED_FILES and filename != "BACKUP_INFO.txt":
-                continue
-
-            if filename in {"kuma.db"}:
-                if relative.parts != ("uptime-kuma", "kuma.db"):
-                    raise ValueError("kuma.db fuera de la raíz esperada")
-                database_found = True
-
-            if filename == "BACKUP_INFO.txt":
-                if relative.parts != ("uptime-kuma", "BACKUP_INFO.txt"):
-                    raise ValueError("Manifiesto fuera de la raíz esperada")
-                manifest_found = True
-
-            target = destination.joinpath(*relative.parts[1:])
+        for member, relative in validated:
+            destination = staging / relative
 
             if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
+                destination.mkdir(parents=True, exist_ok=True)
                 continue
 
-            target.parent.mkdir(parents=True, exist_ok=True)
+            destination.parent.mkdir(parents=True, exist_ok=True)
 
             source = archive.extractfile(member)
 
             if source is None:
-                raise ValueError(f"No se pudo leer: {member.name}")
+                raise RuntimeError(f"No se pudo leer: {member.name}")
 
-            with source, target.open("wb") as output:
+            with source, open(destination, "xb") as output:
                 shutil.copyfileobj(source, output)
 
-    if not database_found or not manifest_found:
-        raise ValueError("El backup no contiene los archivos obligatorios")
+    root = staging / "uptime-kuma"
 
-    manifest = destination / "BACKUP_INFO.txt"
+    manifest = root / "BACKUP_INFO.txt"
+    database = root / "kuma.db"
 
-    content = manifest.read_text(encoding="utf-8")
+    if not manifest.is_file() or not database.is_file():
+        raise RuntimeError("El backup no contiene manifiesto o kuma.db.")
 
-    if "Verificacion SQLite: OK" not in content:
-        raise ValueError("El manifiesto no confirma integridad SQLite")
+    manifest_text = manifest.read_text(
+        encoding="utf-8", errors="replace"
+    )
 
-    database = destination / "kuma.db"
+    if "Verificacion SQLite: OK" not in manifest_text:
+        raise RuntimeError("El manifiesto no confirma la integridad SQLite.")
 
-    if not validate_database(database):
-        raise ValueError("La base de datos del backup no es válida")
+    log("Ejecutando integrity_check en almacenamiento temporal...")
+
+    connection = sqlite3.connect(
+        f"file:{database}?mode=ro",
+        uri=True,
+        timeout=30
+    )
+
+    try:
+        result = connection.execute("PRAGMA integrity_check").fetchone()
+
+        if not result or result[0] != "ok":
+            raise RuntimeError(f"Integridad SQLite incorrecta: {result}")
+    finally:
+        connection.close()
+
+    log("Backup validado correctamente.")
+
+    return root
+
+
+def prepare_restore_files(source, destination):
+    for item in source.iterdir():
+        if item.name in EXCLUDED_FILES:
+            continue
+
+        if item.name == "BACKUP_INFO.txt":
+            continue
+
+        target = destination / item.name
+
+        if item.is_dir():
+            shutil.copytree(item, target)
+        elif item.is_file():
+            shutil.copy2(item, target)
 
 
 def preserve_current_data():
     PRESERVED_DIR.mkdir(parents=True, exist_ok=True)
 
-    destination = PRESERVED_DIR / utc_timestamp()
+    destination = PRESERVED_DIR / "previous-data"
 
     if destination.exists():
-        destination = PRESERVED_DIR / (
-            utc_timestamp() + "_" + str(os.getpid())
+        destination = PRESERVED_DIR / "previous-data-recovery"
+
+    if DATA_DIR.exists():
+        shutil.copytree(
+            DATA_DIR,
+            destination,
+            ignore=shutil.ignore_patterns(".recovery-pending")
         )
 
-    shutil.copytree(
-        DATA_DIR,
-        destination,
-        symlinks=True,
-    )
-
-    log(f"Datos actuales preservados en: {destination}")
+    log(f"Datos anteriores preservados en: {destination}")
 
     return destination
 
 
 def clear_data_directory():
     for item in DATA_DIR.iterdir():
-
         if item.name == ".recovery-pending":
             continue
 
@@ -188,144 +204,89 @@ def clear_data_directory():
             item.unlink()
 
 
-def copy_restored_data(source):
-    for item in source.iterdir():
-
-        if item.name in EXCLUDED_FILES:
-            continue
-
-        if item.name == ".recovery-pending":
-            continue
-
-        destination = DATA_DIR / item.name
-
-        if item.is_dir() and not item.is_symlink():
-            shutil.copytree(item, destination, symlinks=True)
-        elif item.is_symlink():
-            destination.symlink_to(os.readlink(item))
-        else:
-            shutil.copy2(item, destination)
-
-
 def rollback(preserved):
-    log("Intentando recuperar los datos anteriores...")
+    log("ERROR: iniciando rollback.")
 
     clear_data_directory()
 
     for item in preserved.iterdir():
-
         destination = DATA_DIR / item.name
 
-        if item.is_dir() and not item.is_symlink():
-            shutil.copytree(item, destination, symlinks=True)
-        elif item.is_symlink():
-            destination.symlink_to(os.readlink(item))
+        if item.is_dir():
+            shutil.copytree(item, destination)
         else:
             shutil.copy2(item, destination)
 
-    log("Se restauró la copia de seguridad de los datos anteriores.")
+    log("Rollback finalizado.")
 
 
 def main():
-
-    log("Iniciando proceso de recuperación.")
+    log("Iniciando restauración manual.")
 
     if not PENDING_FILE.is_file():
-        log("No existe marca de recuperación. No se requiere restauración.")
-        return 0
+        raise RuntimeError("No existe .recovery-pending.")
 
-    if not DATA_DIR.is_dir():
-        log("ERROR: no existe el directorio de datos.")
-        return 1
+    backup = safe_backup_name()
 
-    if not BACKUP_DIR.is_dir():
-        log("ERROR: no existe el directorio de backups.")
-        return 1
+    with tempfile.TemporaryDirectory(prefix="kuma-restore-") as temp:
+        temp_path = Path(temp)
+        staging = temp_path / "extracted"
+        restored = temp_path / "restored"
 
-    backups = sorted(
-        BACKUP_DIR.glob("uptime-kuma-*.tar.gz"),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
+        staging.mkdir()
+        restored.mkdir()
 
-    if not backups:
-        log("ERROR: no hay backups disponibles.")
-        return 1
+        source = extract_and_validate(backup, staging)
 
-    log(f"Backups encontrados: {len(backups)}")
+        prepare_restore_files(source, restored)
 
-    selected_backup = None
+        staged_database = restored / "kuma.db"
 
-    with tempfile.TemporaryDirectory(prefix="kuma-restore-") as temporary:
+        if not staged_database.is_file():
+            raise RuntimeError("No se preparó la base de datos.")
 
-        temporary_root = Path(temporary)
-
-        for backup in backups:
-
-            log(f"Validando backup: {backup.name}")
-
-            staging = temporary_root / "candidate"
-
-            if staging.exists():
-                shutil.rmtree(staging)
-
-            staging.mkdir()
-
-            try:
-                extract_backup(backup, staging)
-
-                selected_backup = backup
-
-                log(f"Backup válido seleccionado: {backup.name}")
-                break
-
-            except Exception as error:
-                log(f"Backup rechazado: {backup.name}")
-                log(f"Motivo: {error}")
-
-        if selected_backup is None:
-            log("ERROR: ningún backup superó las validaciones.")
-            return 1
+        expected_hash = sha256_file(staged_database)
+        expected_size = staged_database.stat().st_size
 
         preserved = preserve_current_data()
 
         try:
             log("Preparando directorio de datos.")
-
             clear_data_directory()
 
-            copy_restored_data(staging)
+            log("Copiando archivos restaurados.")
+            for item in restored.iterdir():
+                destination = DATA_DIR / item.name
 
-            restored_database = DATA_DIR / "kuma.db"
+                if item.is_dir():
+                    shutil.copytree(item, destination)
+                else:
+                    shutil.copy2(item, destination)
 
-            if not validate_database(restored_database):
+            target_database = DATA_DIR / "kuma.db"
+
+            actual_hash = sha256_file(target_database)
+            actual_size = target_database.stat().st_size
+
+            if actual_size != expected_size or actual_hash != expected_hash:
                 raise RuntimeError(
-                    "La base restaurada no superó la validación final."
+                    "La base copiada no coincide con la base validada."
                 )
 
-            log("Base restaurada y validada correctamente.")
+            PENDING_FILE.unlink()
 
-            PENDING_FILE.unlink(missing_ok=True)
+            log("RESTAURACIÓN COMPLETADA.")
+            log(f"Backup utilizado: {backup.name}")
+            log(f"SHA-256: {actual_hash}")
 
-            log("Marca de recuperación eliminada.")
-            log(f"Backup utilizado: {selected_backup.name}")
-            log(f"Datos anteriores preservados en: {preserved}")
-            log("RECUPERACIÓN COMPLETADA.")
-
-            return 0
-
-        except Exception as error:
-
-            log(f"ERROR durante la restauración: {error}")
-
-            try:
-                rollback(preserved)
-            except Exception as rollback_error:
-                log(f"ERROR CRÍTICO durante rollback: {rollback_error}")
-
-            log("La marca de recuperación se conserva.")
-            return 1
+        except Exception:
+            rollback(preserved)
+            raise
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        main()
+    except Exception as error:
+        log(f"ERROR: {error}")
+        sys.exit(1)
