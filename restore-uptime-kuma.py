@@ -66,7 +66,10 @@ def safe_backup_name():
 
 
 def safe_member_path(member):
-    name = member.name
+    name = member.name.rstrip("/")
+
+    if name == "uptime-kuma" and member.isdir():
+        return Path("uptime-kuma")
 
     if not name.startswith("uptime-kuma/"):
         raise RuntimeError(f"Ruta inesperada en backup: {name}")
