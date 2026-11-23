@@ -1,4 +1,4 @@
-FROM louislam/uptime-kuma:2
+FROM louislam/uptime-kuma:2.5.12
 
 ENV DATA_DIR=/home/uptime-kuma-data
 
