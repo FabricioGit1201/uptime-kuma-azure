@@ -8,6 +8,16 @@ echo " UPTIME KUMA - ARRANQUE PERSONALIZADO"
 echo "=========================================="
 
 echo "Directorio de datos: $DATA_DIR"
+# Instalar WebJob manual en almacenamiento persistente de Azure
+WEBJOB_SOURCE="/app/webjobs/KumaRestoreManual/run.sh"
+WEBJOB_TARGET="/home/site/wwwroot/App_Data/jobs/triggered/KumaRestoreManual"
+
+if [ -f "$WEBJOB_SOURCE" ]; then
+    mkdir -p "$WEBJOB_TARGET"
+    cp "$WEBJOB_SOURCE" "$WEBJOB_TARGET/run.sh"
+    chmod +x "$WEBJOB_TARGET/run.sh"
+    echo "WebJob KumaRestoreManual instalado en almacenamiento persistente."
+fi
 echo "Comprobando recuperación pendiente..."
 
 if [ -f "$DATA_DIR/.recovery-pending" ]; then
