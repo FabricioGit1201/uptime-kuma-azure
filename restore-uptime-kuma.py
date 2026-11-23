@@ -110,7 +110,7 @@ def extract_backup(archive_path, destination):
 
             filename = relative.name
 
-            if filename in EXCLUDED_FILES:
+            if filename in EXCLUDED_FILES and filename != "BACKUP_INFO.txt":
                 continue
 
             if filename in {"kuma.db"}:
