@@ -39,9 +39,3 @@ jobs:
           push: true
           tags: |
             fabricioruizmuro/uptime-kuma-azure:latest
-
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/uptime-kuma-azure:latest
