@@ -1,9 +1,11 @@
+
 name: Build and Publish Uptime Kuma
 
 on:
   push:
     branches:
       - main
+      - feature/auto-recovery
 
 jobs:
   docker:
@@ -19,7 +21,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and push test image
+        if: github.ref == 'refs/heads/feature/auto-recovery'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/uptime-kuma-azure:auto-recovery-test
+
+      - name: Build and push production image
+        if: github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v7
         with:
           context: .
