@@ -12,6 +12,6 @@ COPY App_Data/jobs/triggered/KumaRestoreManual/run.sh /app/webjobs/KumaRestoreMa
 RUN chmod +x /app/azure-entrypoint.sh \
     && chmod +x /app/restore-uptime-kuma.py \
     && chmod +x /app/prepare-manual-restore.py \
-    && chmod +x /home/site/wwwroot/App_Data/jobs/triggered/KumaRestoreManual/run.sh
+    && chmod +x /app/webjobs/KumaRestoreManual/run.sh
 
 CMD ["/app/azure-entrypoint.sh"]
