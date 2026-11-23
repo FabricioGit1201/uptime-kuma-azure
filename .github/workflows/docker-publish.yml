@@ -21,16 +21,25 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push test image
+      - name: Build and publish feature images
         if: github.ref == 'refs/heads/feature/auto-recovery'
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/uptime-kuma-azure:auto-recovery-test
+          tags: |
+            fabricioruizmuro/uptime-kuma-azure:auto-recovery-test
+            fabricioruizmuro/uptime-kuma-azure:azure-recovery-2.5.12-v1
 
-      - name: Build and push production image
+      - name: Build and publish production image
         if: github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            fabricioruizmuro/uptime-kuma-azure:latest
+
         uses: docker/build-push-action@v7
         with:
           context: .
